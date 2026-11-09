@@ -1,0 +1,89 @@
+name: Deploy Terraform (Fresh Setup)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    name: "Terraform Apply (Fresh)"
+    runs-on: ubuntu-latest
+    
+    defaults:
+      run:
+        working-directory: ./terraform
+
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Ensure Clean State
+        run: |
+          rm -f terraform.tfstate terraform.tfstate.backup
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color > plan.txt
+          cat plan.txt
+
+          EOF_DELIMITER=$(openssl rand -hex 8)
+          echo "PLAN_BODY<<${EOF_DELIMITER}" >> $GITHUB_ENV
+          echo "Review the plan output below and reply **approve** or **approved** to proceed with \`terraform apply\`." >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo "<details><summary><b>Show Terraform Plan Output (click to expand)</b></summary>" >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo '```terraform' >> $GITHUB_ENV
+          head -c 60000 plan.txt >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo '```' >> $GITHUB_ENV
+          echo "</details>" >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo "[View Workflow Run Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_ENV
+          echo "${EOF_DELIMITER}" >> $GITHUB_ENV
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+
+      - name: Await Manual Approval
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: matt-gantz
+          minimum-approvals: 1
+          issue-title: "Terraform Fresh Apply Approval: Run ${{ github.run_number }}"
+          issue-body: ${{ env.PLAN_BODY }}
+          exclude-workflow-initiator-as-approver: false
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -no-color
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+
+      - name: Commit and Push Terraform State
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add terraform.tfstate terraform.tfstate.backup || true
+          git commit -m "Save initial Terraform state after fresh deploy [skip ci]" || echo "No changes to state file"
+          git push

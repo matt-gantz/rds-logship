@@ -1,0 +1,169 @@
+name: Deploy Terraform Changes
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  terraform:
+    name: "Terraform Apply (Changes)"
+    runs-on: ubuntu-latest
+    
+    defaults:
+      run:
+        working-directory: ./terraform
+
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Reconcile Existing Resources (idempotency)
+        # Assumes objects already exist and imports any that might be missing from state
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          AWS_REGION="us-east-1"
+
+          # IAM Roles & Policies
+          terraform import aws_iam_role.rds_s3_role rds-sqlserver-s3-role || true
+          terraform import aws_iam_role_policy.rds_s3_policy rds-sqlserver-s3-role:rds-sqlserver-s3-policy || true
+          terraform import aws_iam_user.s3_backup_user s3_backup_user || true
+          terraform import aws_iam_role.cutover_rds_lambda_role rds-logship-cutover-rds-lambda-role || true
+          terraform import aws_iam_role.rds_insert_lambda_role rds-logship-rds-insert-lambda-role || true
+          terraform import aws_iam_role.stop_rds_lambda_role rds-logship-stop-rds-lambda-role || true
+
+          # RDS Option Group
+          terraform import aws_db_option_group.sqlserver_option_group rds-sqlserver-s3-option-group || true
+
+          # VPC (lookup by tag or CIDR)
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=rds-logship-vpc" --query "Vpcs[0].VpcId" --output text 2>/dev/null || echo "")
+          if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+            VPC_ID=$(aws ec2 describe-vpcs --filters "Name=cidr,Values=10.0.0.0/16" --query "Vpcs[0].VpcId" --output text 2>/dev/null || echo "")
+          fi
+          [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ] && terraform import aws_vpc.main "$VPC_ID" || true
+
+          # Internet Gateway
+          IGW_ID=$(aws ec2 describe-internet-gateways --filters "Name=tag:Name,Values=rds-logship-igw" --query "InternetGateways[0].InternetGatewayId" --output text 2>/dev/null || echo "")
+          [ -n "$IGW_ID" ] && [ "$IGW_ID" != "None" ] && terraform import aws_internet_gateway.gw "$IGW_ID" || true
+
+          # Subnets
+          SUBNET_1_ID=$(aws ec2 describe-subnets --filters "Name=tag:Name,Values=rds-logship-public-subnet-1" --query "Subnets[0].SubnetId" --output text 2>/dev/null || echo "")
+          [ -n "$SUBNET_1_ID" ] && [ "$SUBNET_1_ID" != "None" ] && terraform import aws_subnet.public_1 "$SUBNET_1_ID" || true
+
+          SUBNET_2_ID=$(aws ec2 describe-subnets --filters "Name=tag:Name,Values=rds-logship-public-subnet-2" --query "Subnets[0].SubnetId" --output text 2>/dev/null || echo "")
+          [ -n "$SUBNET_2_ID" ] && [ "$SUBNET_2_ID" != "None" ] && terraform import aws_subnet.public_2 "$SUBNET_2_ID" || true
+
+          # Route Table
+          RT_ID=$(aws ec2 describe-route-tables --filters "Name=tag:Name,Values=rds-logship-public-route-table" --query "RouteTables[0].RouteTableId" --output text 2>/dev/null || echo "")
+          [ -n "$RT_ID" ] && [ "$RT_ID" != "None" ] && terraform import aws_route_table.public "$RT_ID" || true
+
+          # Route Table Associations
+          if [ -n "$RT_ID" ] && [ "$RT_ID" != "None" ] && [ -n "$SUBNET_1_ID" ] && [ "$SUBNET_1_ID" != "None" ]; then
+            terraform import aws_route_table_association.public_1 "${SUBNET_1_ID}/${RT_ID}" || true
+          fi
+          if [ -n "$RT_ID" ] && [ "$RT_ID" != "None" ] && [ -n "$SUBNET_2_ID" ] && [ "$SUBNET_2_ID" != "None" ]; then
+            terraform import aws_route_table_association.public_2 "${SUBNET_2_ID}/${RT_ID}" || true
+          fi
+
+          # DB Subnet Group
+          terraform import aws_db_subnet_group.db_subnet_group rds-logship-db-subnet-group || true
+
+          # Security Group
+          SG_ID=$(aws ec2 describe-security-groups --filters "Name=tag:Name,Values=rds-logship-sg" --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "")
+          [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ] && terraform import aws_security_group.rds_sg "$SG_ID" || true
+
+          # S3 Bucket
+          S3_BUCKET=$(aws s3api list-buckets --query "Buckets[?starts_with(Name, 'rds-logship-demo-')].Name | [0]" --output text 2>/dev/null || echo "")
+          if [ -n "$S3_BUCKET" ] && [ "$S3_BUCKET" != "None" ]; then
+            terraform import aws_s3_bucket.demo_bucket "$S3_BUCKET" || true
+            terraform import aws_s3_bucket_public_access_block.public_access "$S3_BUCKET" || true
+          fi
+
+          # ECR Repositories
+          terraform import aws_ecr_repository.cutover_rds_logship rds-logship-cutover-rds-logship || true
+          terraform import aws_ecr_repository.rds_insert_logship rds-logship-rds-insert-logship || true
+
+          # SSM Parameter
+          terraform import aws_ssm_parameter.restore_rds_password /rds-logship/log-ship-restore-user-password || true
+
+          # Lambdas & Log Groups
+          terraform import aws_lambda_function.cutover_rds_logship rds-logship-cutover-rds-logship || true
+          terraform import aws_lambda_function.rds_insert_logship rds-logship-rds-insert-logship || true
+          terraform import aws_lambda_function.stop_rds_instance rds-logship-stop-rds || true
+          terraform import aws_cloudwatch_log_group.cutover_rds_logship /aws/lambda/rds-logship-cutover-rds-logship || true
+          terraform import aws_cloudwatch_log_group.rds_insert_logship /aws/lambda/rds-logship-rds-insert-logship || true
+          terraform import aws_cloudwatch_log_group.stop_rds_lambda /aws/lambda/rds-logship-stop-rds || true
+
+          # RDS Instance
+          terraform import aws_db_instance.sql_server rds-logship-db || true
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -no-color > plan.txt
+          cat plan.txt
+
+          EOF_DELIMITER=$(openssl rand -hex 8)
+          echo "PLAN_BODY<<${EOF_DELIMITER}" >> $GITHUB_ENV
+          echo "Review the plan output below and reply **approve** or **approved** to proceed with \`terraform apply\`." >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo "<details><summary><b>Show Terraform Plan Output (click to expand)</b></summary>" >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo '```terraform' >> $GITHUB_ENV
+          head -c 60000 plan.txt >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo '```' >> $GITHUB_ENV
+          echo "</details>" >> $GITHUB_ENV
+          echo "" >> $GITHUB_ENV
+          echo "[View Workflow Run Logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_ENV
+          echo "${EOF_DELIMITER}" >> $GITHUB_ENV
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+
+      - name: Await Manual Approval
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: matt-gantz
+          minimum-approvals: 1
+          issue-title: "Terraform Apply Changes Approval: Run ${{ github.run_number }}"
+          issue-body: ${{ env.PLAN_BODY }}
+          exclude-workflow-initiator-as-approver: false
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -no-color
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+
+      - name: Commit and Push Terraform State
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add terraform.tfstate terraform.tfstate.backup || true
+          git commit -m "Update Terraform state after applying changes [skip ci]" || echo "No changes to state file"
+          git push

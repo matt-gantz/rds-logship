@@ -1,0 +1,229 @@
+name: Destroy Terraform
+
+on:
+  workflow_dispatch:
+
+jobs:
+  destroy:
+    name: "Full Teardown & Destroy"
+    runs-on: ubuntu-latest
+    
+    defaults:
+      run:
+        working-directory: ./terraform
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Terraform Init
+        run: terraform init || true
+
+      - name: 1. Delete RDS Database Instance
+        run: |
+          echo "Checking for RDS instance: rds-logship-db..."
+          STATUS=$(aws rds describe-db-instances --db-instance-identifier rds-logship-db --query "DBInstances[0].DBInstanceStatus" --output text 2>/dev/null || echo "")
+          if [ -n "$STATUS" ] && [ "$STATUS" != "None" ]; then
+            echo "RDS instance found in state: $STATUS. Deleting..."
+            aws rds delete-db-instance \
+              --db-instance-identifier rds-logship-db \
+              --skip-final-snapshot \
+              --delete-automated-backups 2>/dev/null || true
+            echo "Waiting for RDS instance rds-logship-db to be fully terminated..."
+            aws rds wait db-instance-deleted --db-instance-identifier rds-logship-db 2>/dev/null || true
+            echo "RDS instance successfully deleted."
+          else
+            echo "No RDS instance rds-logship-db found."
+          fi
+
+      - name: 2. Delete RDS Option Groups & Subnet Groups
+        run: |
+          echo "Deleting RDS DB Subnet Group: rds-logship-db-subnet-group..."
+          aws rds delete-db-subnet-group --db-subnet-group-name rds-logship-db-subnet-group 2>/dev/null || true
+
+          echo "Deleting RDS Option Group: rds-sqlserver-s3-option-group..."
+          aws rds delete-option-group --option-group-name rds-sqlserver-s3-option-group 2>/dev/null || true
+
+      - name: 3. Delete Lambda Functions & CloudWatch Logs
+        run: |
+          LAMBDAS=$(aws lambda list-functions --query "Functions[?starts_with(FunctionName, 'rds-logship')].FunctionName" --output text 2>/dev/null || echo "")
+          for FN in $LAMBDAS; do
+            echo "Deleting Lambda function: $FN"
+            aws lambda delete-function --function-name "$FN" 2>/dev/null || true
+            echo "Deleting CloudWatch Log Group: /aws/lambda/$FN"
+            aws logs delete-log-group --log-group-name "/aws/lambda/$FN" 2>/dev/null || true
+          done
+
+      - name: 4. Delete ECR Repositories
+        run: |
+          REPOS=$(aws ecr describe-repositories --query "repositories[?starts_with(repositoryName, 'rds-logship')].repositoryName" --output text 2>/dev/null || echo "")
+          for REPO in $REPOS; do
+            echo "Deleting ECR repository: $REPO"
+            aws ecr delete-repository --repository-name "$REPO" --force 2>/dev/null || true
+          done
+
+      - name: 5. Delete SSM Parameters
+        run: |
+          echo "Deleting SSM parameters under /rds-logship..."
+          PARAMS=$(aws ssm get-parameters-by-path --path "/rds-logship" --recursive --query "Parameters[].Name" --output text 2>/dev/null || echo "")
+          for P in $PARAMS; do
+            echo "Deleting parameter: $P"
+            aws ssm delete-parameter --name "$P" 2>/dev/null || true
+          done
+          aws ssm delete-parameter --name "/rds-logship/log-ship-restore-user-password" 2>/dev/null || true
+
+      - name: 6. Delete IAM Users, Roles & Policies
+        run: |
+          # 1. IAM User
+          IAM_USER="s3_backup_user"
+          if aws iam get-user --user-name "$IAM_USER" 2>/dev/null; then
+            echo "Deleting IAM User: $IAM_USER"
+            ACCESS_KEYS=$(aws iam list-access-keys --user-name "$IAM_USER" --query "AccessKeyMetadata[].AccessKeyId" --output text 2>/dev/null || echo "")
+            for KEY in $ACCESS_KEYS; do
+              echo "  Deleting access key: $KEY"
+              aws iam delete-access-key --user-name "$IAM_USER" --access-key-id "$KEY" 2>/dev/null || true
+            done
+            USER_POLICIES=$(aws iam list-user-policies --user-name "$IAM_USER" --query "PolicyNames[]" --output text 2>/dev/null || echo "")
+            for POL in $USER_POLICIES; do
+              echo "  Deleting user inline policy: $POL"
+              aws iam delete-user-policy --user-name "$IAM_USER" --policy-name "$POL" 2>/dev/null || true
+            done
+            ATTACHED_POLICIES=$(aws iam list-attached-user-policies --user-name "$IAM_USER" --query "AttachedPolicies[].PolicyArn" --output text 2>/dev/null || echo "")
+            for AP in $ATTACHED_POLICIES; do
+              echo "  Detaching managed policy: $AP"
+              aws iam detach-user-policy --user-name "$IAM_USER" --policy-arn "$AP" 2>/dev/null || true
+            done
+            aws iam delete-user --user-name "$IAM_USER" 2>/dev/null || true
+          fi
+
+          # 2. IAM Roles
+          ROLES=(
+            "rds-sqlserver-s3-role"
+            "rds-logship-cutover-rds-lambda-role"
+            "rds-logship-rds-insert-lambda-role"
+            "rds-logship-stop-rds-lambda-role"
+          )
+          for ROLE in "${ROLES[@]}"; do
+            if aws iam get-role --role-name "$ROLE" 2>/dev/null; then
+              echo "Deleting IAM Role: $ROLE"
+              INLINE=$(aws iam list-role-policies --role-name "$ROLE" --query "PolicyNames[]" --output text 2>/dev/null || echo "")
+              for POL in $INLINE; do
+                echo "  Deleting role inline policy: $POL"
+                aws iam delete-role-policy --role-name "$ROLE" --policy-name "$POL" 2>/dev/null || true
+              done
+              ATTACHED=$(aws iam list-attached-role-policies --role-name "$ROLE" --query "AttachedPolicies[].PolicyArn" --output text 2>/dev/null || echo "")
+              for AP in $ATTACHED; do
+                echo "  Detaching managed policy: $AP"
+                aws iam detach-role-policy --role-name "$ROLE" --policy-arn "$AP" 2>/dev/null || true
+              done
+              aws iam delete-role --role-name "$ROLE" 2>/dev/null || true
+            fi
+          done
+
+      - name: 7. Empty and Delete S3 Buckets
+        run: |
+          BUCKETS=$(aws s3api list-buckets --query "Buckets[?starts_with(Name, 'rds-logship')].Name" --output text 2>/dev/null || echo "")
+          for BUCKET in $BUCKETS; do
+            echo "Emptying S3 bucket: $BUCKET"
+            VERSIONS=$(aws s3api list-object-versions --bucket "$BUCKET" --output json 2>/dev/null || echo "")
+            if [ -n "$VERSIONS" ] && [ "$VERSIONS" != "{}" ]; then
+              OBJ_VERSIONS=$(echo "$VERSIONS" | jq -r '[.Versions[]? // empty | {Key: .Key, VersionId: .VersionId}]')
+              if [ "$OBJ_VERSIONS" != "[]" ] && [ -n "$OBJ_VERSIONS" ]; then
+                aws s3api delete-objects --bucket "$BUCKET" --delete "{\"Objects\": $OBJ_VERSIONS}" 2>/dev/null || true
+              fi
+              DEL_MARKERS=$(echo "$VERSIONS" | jq -r '[.DeleteMarkers[]? // empty | {Key: .Key, VersionId: .VersionId}]')
+              if [ "$DEL_MARKERS" != "[]" ] && [ -n "$DEL_MARKERS" ]; then
+                aws s3api delete-objects --bucket "$BUCKET" --delete "{\"Objects\": $DEL_MARKERS}" 2>/dev/null || true
+              fi
+            fi
+            aws s3 rm "s3://$BUCKET" --recursive 2>/dev/null || true
+            echo "Deleting bucket: $BUCKET"
+            aws s3api delete-bucket --bucket "$BUCKET" 2>/dev/null || true
+          done
+
+      - name: 8. Delete VPC Networking (VPC, Subnets, IGWs, Route Tables, SGs)
+        run: |
+          # Identify VPCs by tag rds-logship-vpc or CIDR 10.0.0.0/16
+          VPC_IDS=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=rds-logship-vpc" --query "Vpcs[].VpcId" --output text 2>/dev/null || echo "")
+          if [ -z "$VPC_IDS" ] || [ "$VPC_IDS" = "None" ]; then
+            VPC_IDS=$(aws ec2 describe-vpcs --filters "Name=cidr,Values=10.0.0.0/16" --query "Vpcs[].VpcId" --output text 2>/dev/null || echo "")
+          fi
+
+          for VPC in $VPC_IDS; do
+            echo "Cleaning up VPC: $VPC"
+
+            # 1. Delete Security Groups in VPC (except default)
+            SG_IDS=$(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC" --query "SecurityGroups[?GroupName!='default'].GroupId" --output text 2>/dev/null || echo "")
+            for SG in $SG_IDS; do
+              echo "  Deleting Security Group: $SG"
+              aws ec2 delete-security-group --group-id "$SG" 2>/dev/null || true
+            done
+
+            # 2. Detach and delete Internet Gateways
+            IGW_IDS=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC" --query "InternetGateways[].InternetGatewayId" --output text 2>/dev/null || echo "")
+            for IGW in $IGW_IDS; do
+              echo "  Detaching and deleting Internet Gateway: $IGW"
+              aws ec2 detach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "$VPC" 2>/dev/null || true
+              aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" 2>/dev/null || true
+            done
+
+            # 3. Disassociate and delete non-main Route Tables
+            RT_IDS=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC" --query "RouteTables[?Associations[0].Main!=true].RouteTableId" --output text 2>/dev/null || echo "")
+            for RT in $RT_IDS; do
+              ASSOCS=$(aws ec2 describe-route-tables --route-table-ids "$RT" --query "RouteTables[0].Associations[?!Main].RouteTableAssociationId" --output text 2>/dev/null || echo "")
+              for ASSOC in $ASSOCS; do
+                echo "  Disassociating Route Table Association: $ASSOC"
+                aws ec2 disassociate-route-table --association-id "$ASSOC" 2>/dev/null || true
+              done
+              echo "  Deleting Route Table: $RT"
+              aws ec2 delete-route-table --route-table-id "$RT" 2>/dev/null || true
+            done
+
+            # 4. Delete Subnets in VPC
+            SUBNET_IDS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC" --query "Subnets[].SubnetId" --output text 2>/dev/null || echo "")
+            for SUB in $SUBNET_IDS; do
+              echo "  Deleting Subnet: $SUB"
+              aws ec2 delete-subnet --subnet-id "$SUB" 2>/dev/null || true
+            done
+
+            # 5. Delete VPC
+            echo "  Deleting VPC: $VPC"
+            aws ec2 delete-vpc --vpc-id "$VPC" 2>/dev/null || true
+          done
+
+          # Cleanup any standalone IGW tagged rds-logship-igw if detached
+          STANDALONE_IGWS=$(aws ec2 describe-internet-gateways --filters "Name=tag:Name,Values=rds-logship-igw" --query "InternetGateways[].InternetGatewayId" --output text 2>/dev/null || echo "")
+          for IGW in $STANDALONE_IGWS; do
+            echo "  Deleting standalone Internet Gateway: $IGW"
+            aws ec2 delete-internet-gateway --internet-gateway-id "$IGW" 2>/dev/null || true
+          done
+
+      - name: 9. Terraform Destroy (State Fallback)
+        run: |
+          terraform destroy -auto-approve -no-color || echo "Terraform destroy completed with warnings or empty state."
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD || 'dummyPassword123!' }}
+
+      - name: 10. Clean up and Commit state deletion
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git rm -f terraform.tfstate terraform.tfstate.backup 2>/dev/null || rm -f terraform.tfstate terraform.tfstate.backup
+          git add terraform.tfstate terraform.tfstate.backup 2>/dev/null || true
+          git commit -m "Remove Terraform state files after full demo destroy [skip ci]" || echo "No files to remove"
+          git push
